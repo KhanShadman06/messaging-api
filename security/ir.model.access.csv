@@ -1,0 +1,5 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_messaging_thread_user,messaging.thread.user,model_messaging_thread,base.group_user,1,1,1,1
+access_messaging_message_user,messaging.message.user,model_messaging_message,base.group_user,1,1,1,1
+access_messaging_thread_public,messaging.thread.public,model_messaging_thread,base.group_public,1,0,0,0
+access_messaging_message_public,messaging.message.public,model_messaging_message,base.group_public,1,0,0,0
