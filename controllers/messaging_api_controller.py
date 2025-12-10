@@ -11,6 +11,60 @@ _logger = logging.getLogger(__name__)
 
 class MessagingAPIController(http.Controller):
 
+    def _serialize_partner(self, partner, include_contact=False):
+        """Return payload info using linked user id when available."""
+        user = partner.user_ids[:1]
+        data = {
+            'id': user.id if user else partner.id,
+            'name': partner.name,
+            'partner_id': partner.id,
+            'user_id': user.id if user else None,
+        }
+        if include_contact:
+            data.update({
+                'email': partner.email,
+                'phone': partner.phone,
+                'mobile': partner.mobile,
+            })
+        return data
+
+    def _normalize_partner_ids(self, identifiers):
+        """Accept user or partner ids and always return partner ids."""
+        if not identifiers:
+            return []
+
+        if not isinstance(identifiers, (list, tuple, set)):
+            identifiers = [identifiers]
+
+        env = request.env
+        res_users = env['res.users'].sudo()
+        res_partner = env['res.partner'].sudo()
+        normalized = []
+        seen = set()
+
+        for identifier in identifiers:
+            if identifier is None:
+                continue
+            try:
+                identifier_int = int(identifier)
+            except (TypeError, ValueError):
+                continue
+
+            partner_id = False
+            user = res_users.browse(identifier_int)
+            if user.exists() and user.partner_id:
+                partner_id = user.partner_id.id
+            else:
+                partner = res_partner.browse(identifier_int)
+                if partner.exists():
+                    partner_id = partner.id
+
+            if partner_id and partner_id not in seen:
+                seen.add(partner_id)
+                normalized.append(partner_id)
+
+        return normalized
+
     # =====================
     # Message APIs (Text Chat)
     # =====================
@@ -33,7 +87,7 @@ class MessagingAPIController(http.Controller):
             if thread_type:
                 domain.append(('thread_type', '=', thread_type))
 
-            threads = request.env['messaging.thread'].sudo().search(domain)
+            threads = request.env['messaging.thread'].search(domain)
 
             result = []
             for thread in threads:
@@ -44,7 +98,7 @@ class MessagingAPIController(http.Controller):
                     'id': thread.id,
                     'name': thread.name,
                     'type': thread.thread_type,
-                    'participants': [{'id': p.id, 'name': p.name} for p in thread.partner_ids],
+                    'participants': [self._serialize_partner(p) for p in thread.partner_ids],
                     'last_message': last_message.body if last_message else '',
                     'last_message_date': last_message.create_date.strftime('%Y-%m-%d %H:%M:%S') if last_message else '',
                     'unread_count': unread_count
@@ -63,7 +117,7 @@ class MessagingAPIController(http.Controller):
 
         Parameters:
         - name: Thread name
-        - partner_ids: List of partner IDs to add as participants
+        - partner_ids: List of user or partner IDs to add as participants
         - thread_type: Type of thread (sms, chat, group)
 
         Returns:
@@ -76,15 +130,18 @@ class MessagingAPIController(http.Controller):
             user_partner_id = request.env.user.partner_id.id
 
             # Include current user in participants
-            if not partner_ids:
-                partner_ids = []
-            if user_partner_id not in partner_ids:
-                partner_ids.append(user_partner_id)
+            normalized_partner_ids = self._normalize_partner_ids(partner_ids) if partner_ids else []
 
-            thread = request.env['messaging.thread'].sudo().create({
+            # Ensure current user is part of the conversation
+            if user_partner_id not in normalized_partner_ids:
+                normalized_partner_ids.append(user_partner_id)
+            if not normalized_partner_ids:
+                normalized_partner_ids = [user_partner_id]
+
+            thread = request.env['messaging.thread'].create({
                 'name': name,
                 'thread_type': thread_type,
-                'partner_ids': [(6, 0, partner_ids)]
+                'partner_ids': [(6, 0, normalized_partner_ids)]
             })
 
             return {
@@ -118,16 +175,24 @@ class MessagingAPIController(http.Controller):
             limit = int(limit) if limit else 50
             offset = int(offset) if offset else 0
 
-            thread = request.env['messaging.thread'].sudo().browse(thread_id)
+            user_partner_id = request.env.user.partner_id.id
+            _logger.info(
+                "MessagingAPI: get_messages thread_id=%s limit=%s offset=%s user_partner=%s",
+                thread_id,
+                limit,
+                offset,
+                user_partner_id,
+            )
+
+            thread = request.env['messaging.thread'].browse(thread_id)
             if not thread.exists():
                 return {'error': 'Thread not found'}
 
             # Check if user is participant
-            user_partner_id = request.env.user.partner_id.id
             if user_partner_id not in thread.partner_ids.ids:
                 return {'error': 'Access denied'}
 
-            messages = request.env['messaging.message'].sudo().search([
+            messages = request.env['messaging.message'].search([
                 ('thread_id', '=', thread_id)
             ], order='create_date desc', limit=limit, offset=offset)
 
@@ -135,6 +200,7 @@ class MessagingAPIController(http.Controller):
 
             result = []
             for msg in messages:
+                author_info = self._serialize_partner(msg.author_id)
                 attachments = [{
                     'id': a.id,
                     'name': a.name,
@@ -146,8 +212,10 @@ class MessagingAPIController(http.Controller):
 
                 result.append({
                     'id': msg.id,
-                    'author_id': msg.author_id.id,
-                    'author_name': msg.author_id.name,
+                    'author_id': author_info['id'],
+                    'author_partner_id': author_info['partner_id'],
+                    'author_user_id': author_info['user_id'],
+                    'author_name': author_info['name'],
                     'body': msg.body,
                     'message_type': msg.message_type,
                     'is_read': msg.is_read,
@@ -155,11 +223,17 @@ class MessagingAPIController(http.Controller):
                     'attachments': attachments
                 })
 
-            return {
+            response = {
                 'messages': result,
                 'thread_id': thread_id,
                 'thread_name': thread.name
             }
+            _logger.info(
+                "MessagingAPI: get_messages response_count=%s thread_id=%s",
+                len(result),
+                thread_id,
+            )
+            return response
 
         except Exception as e:
             _logger.error(f"Error fetching messages: {str(e)}")
@@ -184,7 +258,14 @@ class MessagingAPIController(http.Controller):
                 return {'error': 'thread_id and body are required'}
 
             thread_id = int(thread_id)
-            thread = request.env['messaging.thread'].sudo().browse(thread_id)
+            _logger.info(
+                "MessagingAPI: send_message request thread_id=%s body=%s attachments=%s",
+                thread_id,
+                body,
+                attachment_ids,
+            )
+
+            thread = request.env['messaging.thread'].browse(thread_id)
 
             if not thread.exists():
                 return {'error': 'Thread not found'}
@@ -204,13 +285,20 @@ class MessagingAPIController(http.Controller):
             if attachment_ids:
                 message_vals['attachment_ids'] = [(6, 0, attachment_ids)]
 
-            message = request.env['messaging.message'].sudo().create(message_vals)
+            message = request.env['messaging.message'].create(message_vals)
 
-            return {
+            response = {
                 'success': True,
                 'message_id': message.id,
                 'created_date': message.create_date.strftime('%Y-%m-%d %H:%M:%S')
             }
+            _logger.info(
+                "MessagingAPI: send_message created message_id=%s thread_id=%s author_id=%s",
+                message.id,
+                thread_id,
+                user_partner_id,
+            )
+            return response
 
         except Exception as e:
             _logger.error(f"Error sending message: {str(e)}")
@@ -236,7 +324,7 @@ class MessagingAPIController(http.Controller):
             else:
                 return {'error': 'message_id or message_ids required'}
 
-            messages = request.env['messaging.message'].sudo().browse(message_ids)
+            messages = request.env['messaging.message'].browse(message_ids)
             messages.mark_as_read()
 
             return {
@@ -260,7 +348,7 @@ class MessagingAPIController(http.Controller):
         try:
             user_partner_id = request.env.user.partner_id.id
 
-            threads = request.env['messaging.thread'].sudo().search([
+            threads = request.env['messaging.thread'].search([
                 ('partner_ids', 'in', [user_partner_id])
             ])
 
@@ -428,7 +516,7 @@ class MessagingAPIController(http.Controller):
             user_partner_id = request.env.user.partner_id.id
 
             # Find if attachment is linked to any message
-            messages = request.env['messaging.message'].sudo().search([
+            messages = request.env['messaging.message'].search([
                 ('attachment_ids', 'in', [attachment_id])
             ])
 
@@ -511,13 +599,7 @@ class MessagingAPIController(http.Controller):
 
             result = []
             for partner in partners:
-                result.append({
-                    'id': partner.id,
-                    'name': partner.name,
-                    'email': partner.email,
-                    'phone': partner.phone,
-                    'mobile': partner.mobile
-                })
+                result.append(self._serialize_partner(partner, include_contact=True))
 
             return {'partners': result}
 
@@ -537,7 +619,7 @@ class MessagingAPIController(http.Controller):
         - participants: List of participants
         """
         try:
-            thread = request.env['messaging.thread'].sudo().browse(thread_id)
+            thread = request.env['messaging.thread'].browse(thread_id)
 
             if not thread.exists():
                 return {'error': 'Thread not found'}
@@ -549,12 +631,7 @@ class MessagingAPIController(http.Controller):
 
             result = []
             for partner in thread.partner_ids:
-                result.append({
-                    'id': partner.id,
-                    'name': partner.name,
-                    'email': partner.email,
-                    'phone': partner.phone
-                })
+                result.append(self._serialize_partner(partner, include_contact=True))
 
             return {
                 'thread_id': thread_id,
@@ -573,7 +650,7 @@ class MessagingAPIController(http.Controller):
 
         Parameters:
         - thread_id: ID of the thread
-        - partner_id: ID of partner to add
+        - partner_id: ID of user or partner to add
 
         Returns:
         - success: Boolean
@@ -582,7 +659,7 @@ class MessagingAPIController(http.Controller):
             if not thread_id or not partner_id:
                 return {'error': 'thread_id and partner_id are required'}
 
-            thread = request.env['messaging.thread'].sudo().browse(int(thread_id))
+            thread = request.env['messaging.thread'].browse(int(thread_id))
 
             if not thread.exists():
                 return {'error': 'Thread not found'}
@@ -592,14 +669,25 @@ class MessagingAPIController(http.Controller):
             if user_partner_id not in thread.partner_ids.ids:
                 return {'error': 'Access denied'}
 
-            thread.write({
-                'partner_ids': [(4, int(partner_id))]
-            })
+            normalized_ids = self._normalize_partner_ids([partner_id])
+            if not normalized_ids:
+                return {'error': 'Participant not found'}
+
+            participant_partner_id = normalized_ids[0]
+            if participant_partner_id not in thread.partner_ids.ids:
+                thread.write({
+                    'partner_ids': [(4, participant_partner_id)]
+                })
+
+            partner_record = request.env['res.partner'].sudo().browse(participant_partner_id)
+            participant_info = self._serialize_partner(partner_record)
 
             return {
                 'success': True,
                 'thread_id': thread.id,
-                'partner_id': int(partner_id)
+                'partner_id': participant_info['partner_id'],
+                'user_id': participant_info['user_id'],
+                'participant': participant_info
             }
 
         except Exception as e:
@@ -633,12 +721,20 @@ class MessagingAPIController(http.Controller):
             timeout = min(int(timeout) if timeout else 30, 60)  # Max 60 seconds
             last_message_id = int(last_message_id) if last_message_id else 0
 
-            thread = request.env['messaging.thread'].sudo().browse(thread_id)
+            user_partner_id = request.env.user.partner_id.id
+            _logger.info(
+                "MessagingAPI: poll_messages start thread_id=%s last_message_id=%s timeout=%s user_partner=%s",
+                thread_id,
+                last_message_id,
+                timeout,
+                user_partner_id,
+            )
+
+            thread = request.env['messaging.thread'].browse(thread_id)
             if not thread.exists():
                 return {'error': 'Thread not found'}
 
             # Check if user is participant
-            user_partner_id = request.env.user.partner_id.id
             if user_partner_id not in thread.partner_ids.ids:
                 return {'error': 'Access denied'}
 
@@ -656,7 +752,7 @@ class MessagingAPIController(http.Controller):
                 if last_message_id:
                     domain.append(('id', '>', last_message_id))
 
-                new_messages = request.env['messaging.message'].sudo().search(
+                new_messages = request.env['messaging.message'].search(
                     domain,
                     order='create_date asc'
                 )
@@ -664,6 +760,7 @@ class MessagingAPIController(http.Controller):
                 if new_messages:
                     result = []
                     for msg in new_messages:
+                        author_info = self._serialize_partner(msg.author_id)
                         attachments = [{
                             'id': a.id,
                             'name': a.name,
@@ -675,8 +772,10 @@ class MessagingAPIController(http.Controller):
 
                         result.append({
                             'id': msg.id,
-                            'author_id': msg.author_id.id,
-                            'author_name': msg.author_id.name,
+                            'author_id': author_info['id'],
+                            'author_partner_id': author_info['partner_id'],
+                            'author_user_id': author_info['user_id'],
+                            'author_name': author_info['name'],
                             'body': msg.body,
                             'message_type': msg.message_type,
                             'is_read': msg.is_read,
@@ -684,21 +783,34 @@ class MessagingAPIController(http.Controller):
                             'attachments': attachments
                         })
 
-                    return {
+                    response = {
                         'has_new': True,
                         'messages': result,
                         'count': len(result)
                     }
+                    _logger.info(
+                        "MessagingAPI: poll_messages new_messages=%s thread_id=%s last_message_id=%s",
+                        len(result),
+                        thread_id,
+                        last_message_id,
+                    )
+                    return response
 
                 # Wait before checking again
                 time.sleep(poll_interval)
 
             # Timeout reached, no new messages
-            return {
+            response = {
                 'has_new': False,
                 'messages': [],
                 'count': 0
             }
+            _logger.info(
+                "MessagingAPI: poll_messages timeout thread_id=%s last_message_id=%s",
+                thread_id,
+                last_message_id,
+            )
+            return response
 
         except Exception as e:
             _logger.error(f"Error in long polling: {str(e)}")
@@ -729,7 +841,7 @@ class MessagingAPIController(http.Controller):
             poll_interval = 2
 
             # Get initial unread count
-            threads = request.env['messaging.thread'].sudo().search([
+            threads = request.env['messaging.thread'].search([
                 ('partner_ids', 'in', [user_partner_id])
             ])
 
@@ -821,7 +933,8 @@ class MessagingAPIController(http.Controller):
 
             return {
                 'success': True,
-                'partner_id': partner.id
+                'partner_id': partner.id,
+                'user_id': user.id
             }
 
         except Exception as e:
@@ -849,7 +962,8 @@ class MessagingAPIController(http.Controller):
 
             return {
                 'success': True,
-                'partner_id': partner.id
+                'partner_id': partner.id,
+                'user_id': user.id
             }
 
         except Exception as e:
@@ -907,6 +1021,7 @@ class MessagingAPIController(http.Controller):
             return {
                 'success': True,
                 'partner_id': partner.id,
+                'user_id': user.id,
                 'status': status
             }
 
@@ -920,7 +1035,7 @@ class MessagingAPIController(http.Controller):
         Get online status of specific partners
 
         Parameters:
-        - partner_ids: List of partner IDs to check
+        - partner_ids: List of user or partner IDs to check
 
         Returns:
         - presence: List of partner presence info
@@ -929,9 +1044,13 @@ class MessagingAPIController(http.Controller):
             if not partner_ids:
                 return {'error': 'partner_ids required'}
 
+            normalized_ids = self._normalize_partner_ids(partner_ids)
+            if not normalized_ids:
+                return {'error': 'No valid partners found'}
+
             from datetime import datetime, timedelta
 
-            partners = request.env['res.partner'].sudo().browse(partner_ids)
+            partners = request.env['res.partner'].sudo().browse(normalized_ids)
 
             result = []
             for partner in partners:
@@ -944,12 +1063,13 @@ class MessagingAPIController(http.Controller):
                     is_online = time_diff < timedelta(minutes=5)
                     last_seen = partner.write_date.strftime('%Y-%m-%d %H:%M:%S')
 
-                result.append({
-                    'partner_id': partner.id,
-                    'name': partner.name,
+                partner_info = self._serialize_partner(partner)
+                partner_info.update({
                     'status': 'online' if is_online else 'offline',
                     'last_seen': last_seen
                 })
+
+                result.append(partner_info)
 
             return {
                 'presence': result
@@ -975,7 +1095,7 @@ class MessagingAPIController(http.Controller):
         try:
             user_partner_id = request.env.user.partner_id.id
 
-            threads = request.env['messaging.thread'].sudo().search([
+            threads = request.env['messaging.thread'].search([
                 ('partner_ids', 'in', [user_partner_id])
             ])
 
@@ -1028,12 +1148,12 @@ class MessagingAPIController(http.Controller):
                 domain.append(('thread_id', '=', int(thread_id)))
             else:
                 # Only mark messages in threads where user is participant
-                threads = request.env['messaging.thread'].sudo().search([
+                threads = request.env['messaging.thread'].search([
                     ('partner_ids', 'in', [user_partner_id])
                 ])
                 domain.append(('thread_id', 'in', threads.ids))
 
-            messages = request.env['messaging.message'].sudo().search(domain)
+            messages = request.env['messaging.message'].search(domain)
             count = len(messages)
             messages.write({'is_read': True})
 
