@@ -65,6 +65,24 @@ class MessagingAPIController(http.Controller):
 
         return normalized
 
+    def _serialize_reactions(self, mail_message, user_partner_id):
+        """Return aggregated reactions for a mail.message record."""
+        if not mail_message:
+            return []
+
+        summary = {}
+        for reaction in mail_message.sudo().reaction_ids:
+            info = summary.setdefault(reaction.content, {
+                'content': reaction.content,
+                'count': 0,
+                'user_reacted': False,
+            })
+            info['count'] += 1
+            if reaction.partner_id and reaction.partner_id.id == user_partner_id:
+                info['user_reacted'] = True
+
+        return list(summary.values())
+
     # =====================
     # Message APIs (Text Chat)
     # =====================
@@ -220,7 +238,8 @@ class MessagingAPIController(http.Controller):
                     'message_type': msg.message_type,
                     'is_read': msg.is_read,
                     'created_date': msg.create_date.strftime('%Y-%m-%d %H:%M:%S'),
-                    'attachments': attachments
+                    'attachments': attachments,
+                    'reactions': self._serialize_reactions(msg.mail_message_id, user_partner_id),
                 })
 
             response = {
@@ -302,6 +321,61 @@ class MessagingAPIController(http.Controller):
 
         except Exception as e:
             _logger.error(f"Error sending message: {str(e)}")
+            return {'error': str(e)}
+
+    @http.route('/api/messaging/message/reaction', type='json', auth='user', methods=['POST'], csrf=False)
+    def message_reaction(self, message_id=None, content=None, action='toggle', **kwargs):
+        """
+        Add, remove, or toggle a reaction on a message.
+
+        Parameters:
+        - message_id: messaging.message ID
+        - content: Emoji or reaction string (e.g. "👍")
+        - action: add, remove, or toggle (default toggle)
+        """
+        try:
+            if not message_id or not content:
+                return {'error': 'message_id and content are required'}
+
+            message = request.env['messaging.message'].browse(int(message_id))
+            if not message.exists():
+                return {'error': 'Message not found'}
+
+            user_partner_id = request.env.user.partner_id.id
+            if user_partner_id not in message.thread_id.partner_ids.ids:
+                return {'error': 'Access denied'}
+
+            mail_message = message.mail_message_id
+            if not mail_message:
+                return {'error': 'Message not synchronized with Discuss'}
+
+            mail_message_sudo = mail_message.sudo()
+            reaction_model = request.env['mail.message.reaction'].sudo()
+            existing = reaction_model.search([
+                ('message_id', '=', mail_message.id),
+                ('partner_id', '=', user_partner_id),
+                ('content', '=', content),
+            ], limit=1)
+
+            normalized_action = action or 'toggle'
+            if normalized_action not in ('add', 'remove', 'toggle'):
+                return {'error': 'Invalid action'}
+
+            if normalized_action == 'toggle':
+                normalized_action = 'remove' if existing else 'add'
+
+            mail_message_sudo._message_reaction(content, normalized_action)
+
+            return {
+                'success': True,
+                'message_id': message.id,
+                'content': content,
+                'action': normalized_action,
+                'reactions': self._serialize_reactions(mail_message_sudo, user_partner_id),
+            }
+
+        except Exception as e:
+            _logger.error(f"Error processing reaction: {str(e)}")
             return {'error': str(e)}
 
     @http.route('/api/messaging/message/read', type='json', auth='user', methods=['POST'], csrf=False)
@@ -780,7 +854,8 @@ class MessagingAPIController(http.Controller):
                             'message_type': msg.message_type,
                             'is_read': msg.is_read,
                             'created_date': msg.create_date.strftime('%Y-%m-%d %H:%M:%S'),
-                            'attachments': attachments
+                            'attachments': attachments,
+                            'reactions': self._serialize_reactions(msg.mail_message_id, user_partner_id),
                         })
 
                     response = {
